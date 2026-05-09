@@ -10,6 +10,7 @@ on:
       - "**/*.scss"
       - "Gemfile"
       - "Gemfile.lock"
+      - ".github/workflows/security.yml"
   push:
     branches: [main]
   schedule:
