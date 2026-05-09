@@ -1,0 +1,46 @@
+name: Link check (lychee)
+
+on:
+  workflow_call:
+    inputs:
+      paths:
+        description: "Glob(s) to scan, space-separated"
+        required: false
+        default: "**/*.md **/*.html"
+        type: string
+      fail-on-error:
+        description: "Fail the job if dead links are found"
+        required: false
+        default: false
+        type: boolean
+      create-issue:
+        description: "Open / update a tracking issue on dead links (push events only)"
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  lychee:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run lychee
+        id: lychee
+        uses: lycheeverse/lychee-action@v3
+        with:
+          args: --no-progress --max-concurrency 4 ${{ inputs.paths }}
+          fail: ${{ inputs.fail-on-error }}
+
+      - name: Open / update tracking issue
+        if: ${{ inputs.create-issue && github.event_name == 'push' && steps.lychee.outputs.exit_code != 0 }}
+        uses: peter-evans/create-issue-from-file@v5
+        with:
+          title: "Link check failures"
+          content-filepath: ./lychee/out.md
+          labels: link-check

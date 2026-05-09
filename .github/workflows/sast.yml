@@ -1,0 +1,88 @@
+name: SAST (Semgrep)
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "'auto' or comma-separated lang packs (javascript, csharp, ruby, python, go, java, php, typescript)"
+        required: false
+        default: "auto"
+        type: string
+      severity-fail:
+        description: "Fail on findings at this severity or above (ERROR | WARNING | INFO | none)"
+        required: false
+        default: "none"
+        type: string
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build config flags
+        id: cfg
+        shell: bash
+        run: |
+          if [[ "${{ inputs.language }}" == "auto" ]]; then
+            echo "flags=--config=auto" >> "$GITHUB_OUTPUT"
+          else
+            flags="--config=p/ci"
+            IFS=',' read -ra packs <<< "${{ inputs.language }}"
+            for p in "${packs[@]}"; do
+              flags="$flags --config=p/$(echo "$p" | xargs)"
+            done
+            echo "flags=$flags" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Semgrep
+        run: semgrep ci ${{ steps.cfg.outputs.flags }} --json --output=semgrep.json || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: semgrep-report
+          path: semgrep.json
+
+      - name: Comment summary on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('semgrep.json', 'utf8'));
+            const counts = { ERROR: 0, WARNING: 0, INFO: 0 };
+            for (const r of (report.results || [])) {
+              const sev = (r.extra?.severity || 'INFO').toUpperCase();
+              if (counts.hasOwnProperty(sev)) counts[sev]++;
+            }
+            const body =
+              `## Semgrep SAST\n\n` +
+              `${counts.ERROR} error · ${counts.WARNING} warning · ${counts.INFO} info\n\n` +
+              `[Report artifact](${context.payload.repository.html_url}/actions/runs/${context.runId}#artifacts)`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      - name: Enforce severity gate
+        if: inputs.severity-fail != 'none'
+        shell: bash
+        run: |
+          gate="${{ inputs.severity-fail }}"
+          findings=$(jq -r --arg g "$gate" '
+            ($g | ascii_upcase) as $G |
+            [.results[]? | select((.extra.severity // "INFO") | ascii_upcase as $s |
+              ($G == "INFO") or ($G == "WARNING" and ($s == "WARNING" or $s == "ERROR")) or ($G == "ERROR" and $s == "ERROR")
+            )] | length' semgrep.json)
+          [[ "$findings" -eq 0 ]] || { echo "Findings at $gate or above: $findings"; exit 1; }
