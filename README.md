@@ -8,6 +8,7 @@ Reusable DevSecOps workflows. Reference: [devsecops.binbashburns.com](https://de
 | `sbom-vuln.yml` | Syft + Grype |
 | `secrets.yml` | gitleaks |
 | `link-check.yml` | lychee |
+| `dast.yml` | ZAP baseline |
 
 Templates per language in `examples/`.
 

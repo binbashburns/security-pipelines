@@ -38,3 +38,6 @@ jobs:
     with:
       paths: "_site/**/*.html"
       create-issue: true
+
+  dast:
+    uses: binbashburns/security-pipelines/.github/workflows/dast.yml@main
