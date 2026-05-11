@@ -42,8 +42,24 @@ jobs:
             echo "flags=$flags" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Seed empty report
+        # Ensures downstream steps always read valid JSON, even if semgrep crashes before writing.
+        shell: bash
+        run: echo '{"results":[],"errors":[],"paths":{"scanned":[],"skipped":[]}}' > semgrep.json
+
       - name: Run Semgrep
-        run: semgrep ci ${{ steps.cfg.outputs.flags }} --json --output=semgrep.json || true
+        shell: bash
+        run: |
+          set +e
+          semgrep scan ${{ steps.cfg.outputs.flags }} \
+            --json --output=semgrep.json \
+            --metrics=off --disable-version-check
+          rc=$?
+          set -e
+          # Without --error, `semgrep scan` returns 0 even when findings exist, so any non-zero is a real tool failure.
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error::semgrep scan exited with code $rc"
+          fi
 
       - name: Upload report
         if: always()
@@ -58,22 +74,76 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const report = JSON.parse(fs.readFileSync('semgrep.json', 'utf8'));
+            let report;
+            try {
+              const raw = fs.readFileSync('semgrep.json', 'utf8');
+              report = raw ? JSON.parse(raw) : {};
+            } catch (e) {
+              report = {};
+            }
+            const results = report.results || [];
             const counts = { ERROR: 0, WARNING: 0, INFO: 0 };
-            for (const r of (report.results || [])) {
+            for (const r of results) {
               const sev = (r.extra?.severity || 'INFO').toUpperCase();
               if (counts.hasOwnProperty(sev)) counts[sev]++;
             }
+            const scanned = (report.paths?.scanned || []).length;
+            const order = { ERROR: 0, WARNING: 1, INFO: 2 };
+            const top = [...results]
+              .sort((a, b) => (order[(a.extra?.severity || 'INFO').toUpperCase()] ?? 3)
+                            - (order[(b.extra?.severity || 'INFO').toUpperCase()] ?? 3))
+              .slice(0, 5);
+
+            let table = '';
+            if (top.length > 0) {
+              table = '\n\n| Severity | Rule | Location |\n| --- | --- | --- |\n';
+              for (const f of top) {
+                const sev = (f.extra?.severity || 'INFO').toUpperCase();
+                const rule = (f.check_id || '').split('.').pop();
+                const loc = `${f.path}:${f.start?.line ?? '?'}`;
+                table += `| ${sev} | \`${rule}\` | \`${loc}\` |\n`;
+              }
+              if (results.length > 5) {
+                table += `\n_Showing top 5 of ${results.length}. Full list in the artifact._`;
+              }
+            }
+
+            const summaryLine = scanned > 0
+              ? `Scanned **${scanned}** file${scanned === 1 ? '' : 's'}.`
+              : `_No files scanned — check that the \`language\` input matches files in the repo._`;
+
             const body =
               `## Semgrep SAST\n\n` +
-              `${counts.ERROR} error · ${counts.WARNING} warning · ${counts.INFO} info\n\n` +
-              `[Report artifact](${context.payload.repository.html_url}/actions/runs/${context.runId}#artifacts)`;
-            await github.rest.issues.createComment({
+              `${summaryLine}\n\n` +
+              `**${counts.ERROR}** error · **${counts.WARNING}** warning · **${counts.INFO}** info` +
+              table +
+              `\n\n[Report artifact](${context.payload.repository.html_url}/actions/runs/${context.runId}#artifacts)`;
+
+            const existing = await github.rest.issues.listComments({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body,
+              per_page: 100,
             });
+            const prior = existing.data.find(c =>
+              (c.user?.type === 'Bot' || c.user?.login === 'github-actions[bot]')
+              && c.body?.startsWith('## Semgrep SAST')
+            );
+            if (prior) {
+              await github.rest.issues.updateComment({
+                comment_id: prior.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            }
 
       - name: Enforce severity gate
         if: inputs.severity-fail != 'none'
