@@ -18,13 +18,17 @@ permissions:
   pull-requests: write
 
 jobs:
+  # Stage 1 — gate: fail-fast on credentials.
+  secrets:
+    uses: binbashburns/security-pipelines/.github/workflows/secrets.yml@main
+
+  # Stage 2 — static analysis, parallel after secrets passes.
   sast:
+    needs: secrets
     uses: binbashburns/security-pipelines/.github/workflows/sast.yml@main
     with:
       language: csharp
 
   sbom:
+    needs: secrets
     uses: binbashburns/security-pipelines/.github/workflows/sbom-vuln.yml@main
-
-  secrets:
-    uses: binbashburns/security-pipelines/.github/workflows/secrets.yml@main

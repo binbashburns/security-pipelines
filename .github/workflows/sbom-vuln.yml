@@ -38,8 +38,19 @@ jobs:
           output-file: sbom.cdx.json
           artifact-name: sbom.cdx.json
 
+      - name: Count scannable components
+        id: deps
+        shell: bash
+        run: |
+          # Syft catalogs GitHub Actions usages, but Grype has no vulnerability data for them.
+          # "Scannable" = anything that isn't a pkg:github/ PURL (language packages, OS packages, container layers, etc).
+          non_action=$(jq '[.components // [] | .[] | select((.purl // "") | startswith("pkg:github/") | not)] | length' sbom.cdx.json)
+          echo "non_action_count=$non_action" >> "$GITHUB_OUTPUT"
+          echo "Scannable (non-Action) components: $non_action"
+
       - name: Vulnerability scan (Grype)
         id: grype
+        if: steps.deps.outputs.non_action_count != '0'
         uses: anchore/scan-action@v6
         with:
           path: ${{ inputs.path }}
@@ -48,7 +59,7 @@ jobs:
           output-format: sarif
 
       - name: Upload SARIF
-        if: always()
+        if: always() && steps.deps.outputs.non_action_count != '0' && steps.grype.outputs.sarif != ''
         uses: actions/upload-artifact@v5
         with:
           name: grype-sarif
@@ -60,25 +71,71 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            let counts = { high: 0, medium: 0, low: 0 };
-            try {
-              const sarif = JSON.parse(fs.readFileSync('${{ steps.grype.outputs.sarif }}', 'utf8'));
-              for (const run of (sarif.runs || [])) {
-                for (const r of (run.results || [])) {
-                  const sev = (r.level || 'note').toLowerCase();
-                  if (sev === 'error') counts.high++;
-                  else if (sev === 'warning') counts.medium++;
-                  else counts.low++;
+            const nonAction = parseInt('${{ steps.deps.outputs.non_action_count }}' || '0', 10);
+            let body;
+            if (nonAction === 0) {
+              body =
+                `## SBOM + Grype\n\n` +
+                `No scannable application dependencies found — SBOM contains only GitHub Action usages. Grype scan skipped.\n\n` +
+                `[SBOM artifact](${context.payload.repository.html_url}/actions/runs/${context.runId}#artifacts)`;
+            } else {
+              const counts = { high: 0, medium: 0, low: 0 };
+              const top = [];
+              const sarifPath = '${{ steps.grype.outputs.sarif }}';
+              try {
+                if (sarifPath) {
+                  const sarif = JSON.parse(fs.readFileSync(sarifPath, 'utf8'));
+                  for (const run of (sarif.runs || [])) {
+                    for (const r of (run.results || [])) {
+                      const sev = (r.level || 'note').toLowerCase();
+                      if (sev === 'error') counts.high++;
+                      else if (sev === 'warning') counts.medium++;
+                      else counts.low++;
+                      if (top.length < 5) {
+                        const loc = r.locations?.[0]?.physicalLocation?.artifactLocation?.uri || '?';
+                        top.push({ sev, rule: r.ruleId || '?', loc });
+                      }
+                    }
+                  }
+                }
+              } catch (e) {}
+              let table = '';
+              if (top.length > 0) {
+                table = '\n\n| Severity | Rule | Location |\n| --- | --- | --- |\n';
+                for (const f of top) {
+                  table += `| ${f.sev} | \`${f.rule}\` | \`${f.loc}\` |\n`;
                 }
               }
-            } catch (e) {}
-            const body =
-              `## SBOM + Grype\n\n` +
-              `${counts.high} high+ · ${counts.medium} medium · ${counts.low} low\n\n` +
-              `[Artifacts](${context.payload.repository.html_url}/actions/runs/${context.runId}#artifacts)`;
-            await github.rest.issues.createComment({
+              body =
+                `## SBOM + Grype\n\n` +
+                `Scanned **${nonAction}** component${nonAction === 1 ? '' : 's'}.\n\n` +
+                `**${counts.high}** high+ · **${counts.medium}** medium · **${counts.low}** low` +
+                table +
+                `\n\n[Artifacts](${context.payload.repository.html_url}/actions/runs/${context.runId}#artifacts)`;
+            }
+
+            const list = await github.rest.issues.listComments({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body,
+              per_page: 100,
             });
+            const prior = list.data.find(c =>
+              (c.user?.type === 'Bot' || c.user?.login === 'github-actions[bot]')
+              && c.body?.startsWith('## SBOM + Grype')
+            );
+            if (prior) {
+              await github.rest.issues.updateComment({
+                comment_id: prior.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            }
