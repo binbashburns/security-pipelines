@@ -1,0 +1,26 @@
+# https://docs.zizmor.sh/configuration/
+rules:
+  # `uses: $/...` is what this audit wants, but actionlint 1.7.12 rejects that syntax.
+  self-repository:
+    ignore:
+      - self-scan.yml
+
+  # Concurrency can't be keyed correctly from inside a reusable workflow: github.workflow
+  # resolves to the caller's name. Callers set it; every examples/ template does.
+  concurrency-limits:
+    ignore:
+      - dast.yml
+      - link-check.yml
+      - sast.yml
+      - sbom-vuln.yml
+      - secrets.yml
+
+  undocumented-permissions:
+    disable: true
+
+  unpinned-uses:
+    config:
+      policies:
+        "*": hash-pin
+        # examples/ use @main; consumers pin their own copy.
+        "binbashburns/*": ref-pin

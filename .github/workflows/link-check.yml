@@ -18,29 +18,157 @@ on:
         required: false
         default: false
         type: boolean
+      site-artifact:
+        description: "Optional artifact from this run containing the built static site"
+        required: false
+        default: ""
+        type: string
+      site-path:
+        description: "Where to download the site artifact; also the root for site-relative links"
+        required: false
+        default: "_site"
+        type: string
+      root-dir:
+        description: "Root for site-absolute links (/about/). Defaults to site-path when site-artifact is set."
+        required: false
+        default: ""
+        type: string
   workflow_dispatch:
+    inputs:
+      paths:
+        description: "Glob(s) to scan, space-separated"
+        required: false
+        default: "**/*.md **/*.html"
+        type: string
+      fail-on-error:
+        description: "Fail the job if dead links are found"
+        required: false
+        default: false
+        type: boolean
+      create-issue:
+        description: "Open / update a tracking issue on dead links (push events only)"
+        required: false
+        default: false
+        type: boolean
+      site-artifact:
+        description: "Optional artifact from this run containing the built static site"
+        required: false
+        default: ""
+        type: string
+      site-path:
+        description: "Where to download the site artifact; also the root for site-relative links"
+        required: false
+        default: "_site"
+        type: string
+      root-dir:
+        description: "Root for site-absolute links (/about/). Defaults to site-path when site-artifact is set."
+        required: false
+        default: ""
+        type: string
 
-permissions:
-  contents: read
-  issues: write
+permissions: {}
 
 jobs:
   lychee:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download built site
+        if: inputs.site-artifact != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.site-artifact }}
+          path: ${{ inputs.site-path }}
+
+      - name: Prepare link arguments
+        id: paths
+        env:
+          LINK_PATHS: ${{ inputs.paths }}
+          SITE_ARTIFACT: ${{ inputs.site-artifact }}
+          SITE_PATH: ${{ inputs.site-path }}
+          ROOT_DIR: ${{ inputs.root-dir }}
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import shlex
+          paths = shlex.split(os.environ['LINK_PATHS'])
+          if not paths:
+              raise SystemExit('paths must contain at least one file or glob')
+          args = ['--no-progress', '--max-concurrency', '4', '--cache', '--max-cache-age', '1d']
+          root_dir = os.environ['ROOT_DIR'] or (os.environ['SITE_PATH'] if os.environ['SITE_ARTIFACT'] else '')
+          if root_dir:
+              args += ['--root-dir', root_dir]
+          args += ['--', *paths]
+          if any(any(c in arg for c in '\n\r\0') for arg in args):
+              raise SystemExit('Link arguments must not contain newlines or NULs')
+          # lychee-action evaluates args in a shell; quote each value as data.
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('args=' + shlex.join(args) + '\n')
+          PYTHON
 
       - name: Run lychee
         id: lychee
-        uses: lycheeverse/lychee-action@v2
+        timeout-minutes: 12
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
-          args: --no-progress --max-concurrency 4 ${{ inputs.paths }}
-          fail: ${{ inputs.fail-on-error }}
+          args: ${{ steps.paths.outputs.args }}
+          fail: false
+          output: ${{ runner.temp }}/lychee.md
+          lycheeVersion: v0.24.2
 
-      - name: Open / update tracking issue
-        if: ${{ inputs.create-issue && github.event_name == 'push' && steps.lychee.outputs.exit_code != 0 }}
-        uses: peter-evans/create-issue-from-file@v5
+      - name: Enforce scan result
+        if: ${{ !cancelled() && steps.lychee.outcome != 'skipped' }}
+        env:
+          SCAN_EXIT_CODE: ${{ steps.lychee.outputs.exit_code }}
+          SCAN_OUTCOME: ${{ steps.lychee.outcome }}
+          FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        run: |
+          case "$SCAN_EXIT_CODE" in
+            0) [[ "$SCAN_OUTCOME" == "success" ]] || { echo "::error::Link check failed; see logs"; exit 1; } ;;
+            2) if [[ "$FAIL_ON_ERROR" == "true" ]]; then echo "::error::Dead links found"; exit 1; fi ;;
+            *) echo "::error::lychee failed to complete; see logs"; exit 1 ;;
+          esac
+
+      - name: Upload link report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          title: "Link check failures"
-          content-filepath: ./lychee/out.md
-          labels: link-check
+          name: lychee-report
+          path: ${{ runner.temp }}/lychee.md
+
+      - name: Update tracking issue
+        if: >-
+          ${{ !cancelled() && inputs.create-issue && github.event_name == 'push' &&
+              (steps.lychee.outputs.exit_code == '2' ||
+               (steps.lychee.outputs.exit_code == '0' && steps.lychee.outcome == 'success')) }}
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SCAN_EXIT_CODE: ${{ steps.lychee.outputs.exit_code }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const marker = '<!-- security-pipelines:link-check -->';
+            const title = 'Link check failures';
+            const params = { owner: context.repo.owner, repo: context.repo.repo };
+            const issues = await github.paginate(github.rest.issues.listForRepo, { ...params, state: 'all', labels: 'link-check', per_page: 100 });
+            const matches = issues.filter(issue => !issue.pull_request && issue.user?.login === 'github-actions[bot]' &&
+              (issue.body?.includes(marker) || issue.title === title));
+            const prior = matches.find(issue => issue.state === 'open') ?? matches[0];
+            const failed = process.env.SCAN_EXIT_CODE === '2';
+            if (!failed && (!prior || prior.state === 'closed')) return;
+            const report = fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'lychee.md'), 'utf8');
+            const body = `${marker}\n\n${report.slice(0, 60000)}`;
+            if (prior) {
+              await github.rest.issues.update({ ...params, issue_number: prior.number, body, state: failed ? 'open' : 'closed' });
+            } else if (failed) {
+              await github.rest.issues.create({ ...params, title, body, labels: ['link-check'] });
+            }

@@ -3,49 +3,82 @@ name: security
 on:
   pull_request:
     branches: [main]
-    paths:
-      - "**/*.rb"
-      - "**/*.html"
-      - "**/*.md"
-      - "**/*.scss"
-      - "Gemfile"
-      - "Gemfile.lock"
-      - ".github/workflows/security.yml"
   push:
     branches: [main]
   schedule:
     - cron: "0 6 * * 1"
 
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
 
 jobs:
-  # Stage 1 — gate: fail-fast on credentials.
+  # Stage 1: secrets gate.
   secrets:
     uses: binbashburns/security-pipelines/.github/workflows/secrets.yml@main
+    permissions:
+      contents: read
 
-  # Stage 2 — static analysis + link audit, parallel after secrets passes.
+  # Build once and transfer the rendered site into each scanning job.
+  build-site:
+    needs: secrets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+      - run: bundle exec jekyll build --destination _site
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jekyll-site
+          path: _site/
+          if-no-files-found: error
+
+  # Stage 2: static analysis and link audit, after secrets passes.
   sast:
     needs: secrets
     if: github.event_name == 'pull_request'
     uses: binbashburns/security-pipelines/.github/workflows/sast.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
     with:
       language: ruby
 
   sbom:
     needs: secrets
     uses: binbashburns/security-pipelines/.github/workflows/sbom-vuln.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
 
   link-check:
-    needs: secrets
+    needs: [secrets, build-site]
     uses: binbashburns/security-pipelines/.github/workflows/link-check.yml@main
+    permissions:
+      contents: read
+      issues: write
     with:
       paths: "_site/**/*.html"
       create-issue: true
+      site-artifact: jekyll-site
+      site-path: _site
 
-  # Stage 3 — dynamic scan. Gated on secrets + sbom; not on sast (PR-only).
+  # Stage 3: dynamic scan. Gated on secrets + sbom; not on sast (PR-only).
   dast:
-    needs: [secrets, sbom]
+    needs: [secrets, sbom, build-site]
     uses: binbashburns/security-pipelines/.github/workflows/dast.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      site-artifact: jekyll-site
+      serve-path: _site

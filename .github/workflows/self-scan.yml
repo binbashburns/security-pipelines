@@ -1,0 +1,150 @@
+name: Self-scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: self-scan-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint workflows and examples
+        run: |
+          # Explicit file args: passing any arg disables actionlint's auto-discovery.
+          docker run --rm -v "$PWD:/repo:ro" -w /repo \
+            rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
+            -color .github/workflows/*.yml examples/*.yml
+
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        id: zizmor
+        uses: zizmorcore/zizmor-action@70fb788f84895a7701f5643d103d587e460b5c99 # v0.6.3
+        with:
+          inputs: ". examples/csharp.yml examples/javascript.yml examples/jekyll.yml examples/static-site.yml"
+          version: "1.30.0"
+          persona: regular
+          min-severity: low
+          advanced-security: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+      - name: Enforce zizmor findings
+        if: ${{ !cancelled() && steps.zizmor.outcome != 'skipped' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SARIF_FILE: ${{ steps.zizmor.outputs.output-file }}
+          ZIZMOR_OUTCOME: ${{ steps.zizmor.outcome }}
+        with:
+          script: |
+            // SARIF output suppresses zizmor's findings exit codes, so the step above
+            // exits 0 regardless. This gate is what actually fails the build.
+            const fs = require('fs');
+            let body = '## zizmor (GitHub Actions static analysis)\n\n';
+            let failure;
+            try {
+              if (process.env.ZIZMOR_OUTCOME !== 'success') throw new Error('zizmor did not complete successfully; see workflow logs.');
+              const sarifFile = process.env.SARIF_FILE;
+              if (!sarifFile || !fs.existsSync(sarifFile)) throw new Error('zizmor produced no SARIF report.');
+              const report = JSON.parse(fs.readFileSync(sarifFile, 'utf8'));
+              if (!Array.isArray(report.runs)) throw new Error('zizmor SARIF contains no runs.');
+              const counts = { error: 0, warning: 0, note: 0, none: 0 };
+              for (const run of report.runs) {
+                for (const result of run.results ?? []) {
+                  const level = result.level ?? 'warning';
+                  if (!Object.hasOwn(counts, level)) throw new Error('zizmor SARIF result has an invalid level.');
+                  counts[level]++;
+                }
+              }
+              body += `**${counts.error}** error · **${counts.warning}** warning · **${counts.note}** note · **${counts.none}** none`;
+              if (counts.error) failure = `${counts.error} error-level zizmor findings.`;
+            } catch (error) {
+              failure = `zizmor gate failed: ${error.message}`;
+            }
+            if (failure) body += `\n\n**Failed:** ${failure}`;
+            await core.summary.addRaw(body).write();
+            if (failure) core.setFailed(failure);
+
+  zizmor-examples-stale:
+    name: zizmor (examples, pedantic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check examples for stale action refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          docker run --rm -v "$PWD:/workspace:ro" -w /workspace -e GH_TOKEN \
+            ghcr.io/zizmorcore/zizmor:1.30.0 \
+            --persona=pedantic --min-severity=low --format=plain -- examples/*.yml
+
+  secrets:
+    name: secrets
+    uses: ./.github/workflows/secrets.yml
+    permissions:
+      contents: read
+
+  sast:
+    name: sast
+    uses: ./.github/workflows/sast.yml
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      language: auto
+      severity-fail: none
+
+  link-check:
+    name: link-check
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/link-check.yml
+    permissions:
+      contents: read
+      issues: write
+    with:
+      paths: "**/*.md"
+      create-issue: true
+
+  sbom:
+    name: sbom
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/sbom-vuln.yml
+    permissions:
+      contents: read
+      pull-requests: write
+
+  # dast is omitted: this repo serves no HTTP surface.

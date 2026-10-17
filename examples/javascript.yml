@@ -3,34 +3,35 @@ name: security
 on:
   pull_request:
     branches: [main]
-    paths:
-      - "**/*.js"
-      - "**/*.mjs"
-      - "**/*.ts"
-      - "**/*.tsx"
-      - "**/*.jsx"
-      - "package.json"
-      - "package-lock.json"
-      - ".github/workflows/security.yml"
   push:
     branches: [main]
 
-permissions:
-  contents: read
-  pull-requests: write
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
 
 jobs:
-  # Stage 1 — gate: fail-fast on credentials.
+  # Stage 1: secrets gate.
   secrets:
     uses: binbashburns/security-pipelines/.github/workflows/secrets.yml@main
+    permissions:
+      contents: read
 
-  # Stage 2 — static analysis, parallel after secrets passes.
+  # Stage 2: static analysis, parallel after secrets passes.
   sast:
     needs: secrets
     uses: binbashburns/security-pipelines/.github/workflows/sast.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
     with:
       language: javascript,typescript
 
   sbom:
     needs: secrets
     uses: binbashburns/security-pipelines/.github/workflows/sbom-vuln.yml@main
+    permissions:
+      contents: read
+      pull-requests: write

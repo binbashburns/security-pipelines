@@ -18,25 +18,122 @@ on:
         required: false
         default: "."
         type: string
+      comment-on-pr:
+        description: "Post or update a PR comment when the token permits it"
+        required: false
+        default: true
+        type: boolean
+      fail-on:
+        description: "Fail on ZAP alert instances at this risk or above (high | medium | low | none)"
+        required: false
+        default: "none"
+        type: string
+      site-artifact:
+        description: "Optional artifact from this run containing the built static site"
+        required: false
+        default: ""
+        type: string
   workflow_dispatch:
+    inputs:
+      target-url:
+        description: "URL ZAP scans (use http://host.docker.internal:PORT for local servers)"
+        required: false
+        default: "http://host.docker.internal:8000"
+        type: string
+      serve-port:
+        description: "Port to serve a static site on. Set 0 to skip the local server and scan target-url directly."
+        required: false
+        default: 8000
+        type: number
+      serve-path:
+        description: "Directory to serve when serve-port > 0"
+        required: false
+        default: "."
+        type: string
+      comment-on-pr:
+        description: "Post or update a PR comment when the token permits it"
+        required: false
+        default: true
+        type: boolean
+      fail-on:
+        description: "Fail on ZAP alert instances at this risk or above (high | medium | low | none)"
+        required: false
+        default: "none"
+        type: string
+      site-artifact:
+        description: "Optional artifact from this run containing the built static site"
+        required: false
+        default: ""
+        type: string
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: {}
 
 jobs:
   zap:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download built site
+        if: inputs.site-artifact != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.site-artifact }}
+          path: ${{ inputs.serve-path }}
+
+      - name: Validate target
+        shell: bash
+        env:
+          TARGET_URL: ${{ inputs.target-url }}
+          SERVE_PORT: ${{ inputs.serve-port }}
+          SERVE_PATH: ${{ inputs.serve-path }}
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          port = os.environ['SERVE_PORT']
+          if not port.isascii() or not port.isdecimal() or not 0 <= int(port) <= 65535:
+              raise SystemExit('serve-port must be an integer between 0 and 65535')
+          target = os.environ['TARGET_URL']
+          url = urlsplit(target)
+          if url.scheme not in ('http', 'https') or not url.hostname or any(c.isspace() for c in target):
+              raise SystemExit('target-url must be an HTTP(S) URL without whitespace')
+          if int(port) and not Path(os.environ['SERVE_PATH']).is_dir():
+              raise SystemExit('serve-path must be an existing directory')
+          PYTHON
+
+      - name: Validate fail-on
+        shell: bash
+        env:
+          FAIL_ON: ${{ inputs.fail-on }}
+        run: |
+          case "$(printf '%s' "$FAIL_ON" | tr '[:upper:]' '[:lower:]')" in
+            none|low|medium|high) ;;
+            *) echo "::error::Invalid fail-on; use high, medium, low, or none"; exit 1 ;;
+          esac
 
       - name: Serve static site
         if: inputs.serve-port > 0
+        timeout-minutes: 3
+        env:
+          SERVE_PATH: ${{ inputs.serve-path }}
+          SERVE_PORT: ${{ inputs.serve-port }}
         run: |
-          cd "${{ inputs.serve-path }}"
-          nohup python3 -m http.server "${{ inputs.serve-port }}" > "$RUNNER_TEMP/server.log" 2>&1 &
-          for i in {1..20}; do
-            if curl -fsS "http://localhost:${{ inputs.serve-port }}/" >/dev/null; then
+          nohup python3 -m http.server "$SERVE_PORT" --directory "$SERVE_PATH" > "$RUNNER_TEMP/server.log" 2>&1 &
+          server_pid=$!
+          echo "$server_pid" > "$RUNNER_TEMP/zap-server.pid"
+          for ((i = 0; i < 20; i++)); do
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              break
+            fi
+            if curl -fsS "http://localhost:$SERVE_PORT/" >/dev/null; then
               exit 0
             fi
             sleep 2
@@ -45,48 +142,111 @@ jobs:
           exit 1
 
       - name: ZAP baseline scan
+        id: scan
+        timeout-minutes: 15
+        env:
+          TARGET_URL: ${{ inputs.target-url }}
         run: |
-          mkdir -p zap-reports && chmod 777 zap-reports
+          mkdir -p "$RUNNER_TEMP/zap-reports"
+          chmod 777 "$RUNNER_TEMP/zap-reports"
+          rc=0
           docker run --rm \
             --add-host=host.docker.internal:host-gateway \
-            -v "$(pwd)/zap-reports:/zap/wrk:rw" \
-            ghcr.io/zaproxy/zaproxy:stable \
+            -v "$RUNNER_TEMP/zap-reports:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:2.17.0 \
             zap-baseline.py \
-              -t "${{ inputs.target-url }}" \
+              -t "$TARGET_URL" \
               -r baseline-report.html \
               -J baseline-report.json \
-              -d -I || true
+              -I || rc=$?
+          # ZAP: 0 = pass, 1 = FAIL alerts, 2 = WARN alerts, 3 = tool failure.
+          case "$rc" in
+            0|2) ;;
+            *) echo "::error::ZAP exited with code $rc"; exit "$rc" ;;
+          esac
 
       - name: Upload reports
-        if: always()
-        uses: actions/upload-artifact@v5
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: zap-reports
-          path: zap-reports/
+          path: ${{ runner.temp }}/zap-reports/
 
-      - name: Comment summary on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v8
+      - name: Summarize scan
+        id: report
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+          FAIL_ON: ${{ inputs.fail-on }}
         with:
           script: |
             const fs = require('fs');
-            let counts = { High: 0, Medium: 0, Low: 0, Informational: 0 };
+            const path = require('path');
+            const summaryFile = 'zap-summary.md';
+            const gate = process.env.FAIL_ON.toUpperCase();
+            const order = { HIGH: 0, MEDIUM: 1, LOW: 2, INFORMATIONAL: 3, NONE: 4 };
+            let body = '## ZAP DAST\n\n';
+            let failure;
             try {
-              const r = JSON.parse(fs.readFileSync('zap-reports/baseline-report.json', 'utf8'));
-              for (const a of (r.site?.[0]?.alerts || [])) {
-                const sev = ({ '3':'High','2':'Medium','1':'Low','0':'Informational' })[a.riskcode] || 'Unknown';
-                const n = a.instances?.length || 0;
-                if (counts.hasOwnProperty(sev)) counts[sev] += n;
+              if (process.env.SCAN_OUTCOME !== 'success') throw new Error('ZAP did not complete successfully; see workflow logs.');
+              const report = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'zap-reports/baseline-report.json'), 'utf8'));
+              if (!Array.isArray(report.site) || !report.site.length) throw new Error('ZAP report contains no scanned sites.');
+              const counts = { High: 0, Medium: 0, Low: 0, Informational: 0 };
+              for (const site of report.site) {
+                if (!Array.isArray(site.alerts)) throw new Error('ZAP site report is missing alerts.');
+                for (const alert of site.alerts) {
+                  const severity = { '3': 'High', '2': 'Medium', '1': 'Low', '0': 'Informational' }[alert.riskcode];
+                  if (!severity || !Array.isArray(alert.instances)) throw new Error('ZAP report contains an invalid alert.');
+                  counts[severity] += alert.instances.length;
+                }
               }
-            } catch (e) {
-              counts = null;
+              body += `${counts.High} high · ${counts.Medium} med · ${counts.Low} low · ${counts.Informational} info`;
+              if (!Object.hasOwn(order, gate)) throw new Error('Invalid fail-on input.');
+              if (gate !== 'NONE') {
+                const gated = Object.entries(counts).reduce(
+                  (sum, [severity, count]) => sum + (order[severity.toUpperCase()] <= order[gate] ? count : 0), 0);
+                if (gated) failure = `${gated} alert instances at ${gate} or above.`;
+              }
+            } catch (error) {
+              failure = `Scan failed: ${error.message}`;
             }
-            const body = counts
-              ? `## ZAP DAST\n\n${counts.High} high · ${counts.Medium} med · ${counts.Low} low · ${counts.Informational} info\n\n[Reports](${context.payload.repository.html_url}/actions/runs/${context.runId}#artifacts)`
-              : `## ZAP DAST\n\nScan failed; see workflow logs.`;
-            await github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body,
-            });
+            if (failure) body += `\n\n**Failed:** ${failure}`;
+            body += `\n\n[Reports](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}#artifacts)`;
+
+            await core.summary.addRaw(body).write();
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, summaryFile), body);
+            core.setOutput('ready', 'true');
+            if (failure) core.setFailed(failure);
+
+      - name: Comment summary on PR
+        if: >-
+          ${{ !cancelled() && steps.report.outputs.ready == 'true' && inputs.comment-on-pr &&
+              github.event_name == 'pull_request' &&
+              github.event.pull_request.head.repo.full_name == github.repository &&
+              github.actor != 'dependabot[bot]' }}
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SUMMARY_FILE: zap-summary.md
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const body = fs.readFileSync(path.join(process.env.RUNNER_TEMP, process.env.SUMMARY_FILE), 'utf8');
+            const marker = body.split('\n', 1)[0];
+            const params = { owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number };
+            const comments = await github.paginate(github.rest.issues.listComments, { ...params, per_page: 100 });
+            const prior = comments.find(c => c.user?.login === 'github-actions[bot]' && c.body?.startsWith(marker));
+            if (prior) {
+              await github.rest.issues.updateComment({ owner: params.owner, repo: params.repo, comment_id: prior.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...params, body });
+            }
+
+      - name: Stop local server
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/zap-server.pid" ]]; then
+            kill "$(cat "$RUNNER_TEMP/zap-server.pid")" 2>/dev/null || true
+          fi
