@@ -18,124 +18,224 @@ on:
         required: false
         default: false
         type: boolean
+      only-fixed:
+        description: "Only report vulnerabilities that have a fix available"
+        required: false
+        default: false
+        type: boolean
+      upload-sarif:
+        description: "Upload the Grype SARIF to code scanning. The calling job must grant security-events: write."
+        required: false
+        default: false
+        type: boolean
+      comment-on-pr:
+        description: "Post or update a PR comment when the token permits it"
+        required: false
+        default: true
+        type: boolean
   workflow_dispatch:
+    inputs:
+      path:
+        description: "Directory to scan"
+        required: false
+        default: "."
+        type: string
+      severity-cutoff:
+        description: "Grype severity cutoff (critical | high | medium | low | negligible)"
+        required: false
+        default: "medium"
+        type: string
+      fail-build:
+        description: "Fail on findings at or above the cutoff"
+        required: false
+        default: false
+        type: boolean
+      only-fixed:
+        description: "Only report vulnerabilities that have a fix available"
+        required: false
+        default: false
+        type: boolean
+      upload-sarif:
+        description: "Upload the Grype SARIF to code scanning. The calling job must grant security-events: write."
+        required: false
+        default: false
+        type: boolean
+      comment-on-pr:
+        description: "Post or update a PR comment when the token permits it"
+        required: false
+        default: true
+        type: boolean
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: {}
 
 jobs:
   syft-grype:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate severity cutoff
+        env:
+          SEVERITY_CUTOFF: ${{ inputs.severity-cutoff }}
+        run: |
+          case "$SEVERITY_CUTOFF" in
+            critical|high|medium|low|negligible) ;;
+            *) echo "::error::Invalid severity-cutoff"; exit 1 ;;
+          esac
 
       - name: Generate SBOM (CycloneDX JSON)
-        uses: anchore/sbom-action@v0
+        id: sbom
+        timeout-minutes: 15
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: ${{ inputs.path }}
           format: cyclonedx-json
-          output-file: sbom.cdx.json
+          output-file: ${{ runner.temp }}/sbom.cdx.json
           artifact-name: sbom.cdx.json
 
       - name: Count scannable components
         id: deps
         shell: bash
         run: |
-          # Syft catalogs GitHub Actions usages, but Grype has no vulnerability data for them.
-          # "Scannable" = anything that isn't a pkg:github/ PURL (language packages, OS packages, container layers, etc).
-          non_action=$(jq '[.components // [] | .[] | select((.purl // "") | startswith("pkg:github/") | not)] | length' sbom.cdx.json)
+          jq -e '.bomFormat == "CycloneDX" and ((.components // []) | type == "array")' "$RUNNER_TEMP/sbom.cdx.json" >/dev/null
+          # GitHub Action PURLs have no matching Grype vulnerability data.
+          non_action=$(jq '[.components // [] | .[] | select((.purl // "") | startswith("pkg:github/") | not)] | length' "$RUNNER_TEMP/sbom.cdx.json")
           echo "non_action_count=$non_action" >> "$GITHUB_OUTPUT"
           echo "Scannable (non-Action) components: $non_action"
 
       - name: Vulnerability scan (Grype)
         id: grype
         if: steps.deps.outputs.non_action_count != '0'
-        uses: anchore/scan-action@v6
+        timeout-minutes: 15
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
-          path: ${{ inputs.path }}
+          sbom: ${{ runner.temp }}/sbom.cdx.json
           fail-build: ${{ inputs.fail-build }}
           severity-cutoff: ${{ inputs.severity-cutoff }}
+          only-fixed: ${{ inputs.only-fixed }}
+          cache-db: true
           output-format: sarif
+          output-file: ${{ runner.temp }}/grype.sarif
 
       - name: Upload SARIF
-        if: always() && steps.deps.outputs.non_action_count != '0' && steps.grype.outputs.sarif != ''
-        uses: actions/upload-artifact@v5
+        if: ${{ !cancelled() && steps.grype.outputs.sarif != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: grype-sarif
           path: ${{ steps.grype.outputs.sarif }}
 
-      - name: Comment summary on PR
-        if: github.event_name == 'pull_request' && always()
-        uses: actions/github-script@v8
+      - name: Summarize scan
+        id: report
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SBOM_OUTCOME: ${{ steps.sbom.outcome }}
+          COUNT_OUTCOME: ${{ steps.deps.outcome }}
+          COMPONENT_COUNT: ${{ steps.deps.outputs.non_action_count }}
+          SCAN_OUTCOME: ${{ steps.grype.outcome }}
+          SARIF_PATH: ${{ steps.grype.outputs.sarif }}
         with:
           script: |
             const fs = require('fs');
-            const nonAction = parseInt('${{ steps.deps.outputs.non_action_count }}' || '0', 10);
-            let body;
-            if (nonAction === 0) {
-              body =
-                `## SBOM + Grype\n\n` +
-                `No scannable application dependencies found — SBOM contains only GitHub Action usages. Grype scan skipped.\n\n` +
-                `[SBOM artifact](${context.payload.repository.html_url}/actions/runs/${context.runId}#artifacts)`;
-            } else {
-              const counts = { high: 0, medium: 0, low: 0 };
-              const top = [];
-              const sarifPath = '${{ steps.grype.outputs.sarif }}';
-              try {
-                if (sarifPath) {
-                  const sarif = JSON.parse(fs.readFileSync(sarifPath, 'utf8'));
-                  for (const run of (sarif.runs || [])) {
-                    for (const r of (run.results || [])) {
-                      const sev = (r.level || 'note').toLowerCase();
-                      if (sev === 'error') counts.high++;
-                      else if (sev === 'warning') counts.medium++;
-                      else counts.low++;
-                      if (top.length < 5) {
-                        const loc = r.locations?.[0]?.physicalLocation?.artifactLocation?.uri || '?';
-                        top.push({ sev, rule: r.ruleId || '?', loc });
-                      }
-                    }
+            const path = require('path');
+            const summaryFile = 'grype-summary.md';
+            let body = '## SBOM + Grype\n\n';
+            let failure;
+            try {
+              const count = process.env.COMPONENT_COUNT;
+              if (process.env.SBOM_OUTCOME !== 'success' || process.env.COUNT_OUTCOME !== 'success' || !/^\d+$/.test(count)) {
+                throw new Error('SBOM generation or component counting failed; see workflow logs.');
+              }
+              const nonAction = Number(count);
+              if (nonAction === 0) {
+                body += 'No scannable application dependencies found. Grype scan skipped.';
+              } else {
+                if (!['success', 'failure'].includes(process.env.SCAN_OUTCOME)) throw new Error('Grype did not run.');
+                const report = JSON.parse(fs.readFileSync(process.env.SARIF_PATH, 'utf8'));
+                if (!Array.isArray(report.runs) || !report.runs.length) throw new Error('Grype SARIF report contains no runs.');
+                const counts = { error: 0, warning: 0, note: 0, none: 0 };
+                for (const run of report.runs) {
+                  const results = run.results ?? [];
+                  if (!Array.isArray(results)) throw new Error('Grype SARIF results are invalid.');
+                  for (const result of results) {
+                    const level = result.level ?? 'warning';
+                    if (!Object.hasOwn(counts, level)) throw new Error('Grype SARIF result has an invalid level.');
+                    counts[level]++;
                   }
                 }
-              } catch (e) {}
-              let table = '';
-              if (top.length > 0) {
-                table = '\n\n| Severity | Rule | Location |\n| --- | --- | --- |\n';
-                for (const f of top) {
-                  table += `| ${f.sev} | \`${f.rule}\` | \`${f.loc}\` |\n`;
+                body += `Scanned **${nonAction}** components from the generated SBOM.\n\n`;
+                body += `SARIF levels: **${counts.error}** error · **${counts.warning}** warning · **${counts.note}** note · **${counts.none}** none.\n\nSee the SARIF artifact for vulnerability severities.`;
+                if (process.env.SCAN_OUTCOME !== 'success') {
+                  failure = 'Grype failed or its severity gate was reached; see workflow logs.';
+                  body += `\n\n**Failed:** ${failure}`;
                 }
               }
-              body =
-                `## SBOM + Grype\n\n` +
-                `Scanned **${nonAction}** component${nonAction === 1 ? '' : 's'}.\n\n` +
-                `**${counts.high}** high+ · **${counts.medium}** medium · **${counts.low}** low` +
-                table +
-                `\n\n[Artifacts](${context.payload.repository.html_url}/actions/runs/${context.runId}#artifacts)`;
+            } catch (error) {
+              failure = `Scan failed: ${error.message}`;
+              body += failure;
+            }
+            body += `\n\n[Artifacts](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}#artifacts)`;
+
+            await core.summary.addRaw(body).write();
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, summaryFile), body);
+            core.setOutput('ready', 'true');
+            if (failure) core.setFailed(failure);
+
+      - name: Comment summary on PR
+        if: >-
+          ${{ !cancelled() && steps.report.outputs.ready == 'true' && inputs.comment-on-pr &&
+              github.event_name == 'pull_request' &&
+              github.event.pull_request.head.repo.full_name == github.repository &&
+              github.actor != 'dependabot[bot]' }}
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SUMMARY_FILE: grype-summary.md
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const body = fs.readFileSync(path.join(process.env.RUNNER_TEMP, process.env.SUMMARY_FILE), 'utf8');
+            const marker = body.split('\n', 1)[0];
+            const params = { owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number };
+            const comments = await github.paginate(github.rest.issues.listComments, { ...params, per_page: 100 });
+            const prior = comments.find(c => c.user?.login === 'github-actions[bot]' && c.body?.startsWith(marker));
+            if (prior) {
+              await github.rest.issues.updateComment({ owner: params.owner, repo: params.repo, comment_id: prior.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...params, body });
             }
 
-            const list = await github.rest.issues.listComments({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              per_page: 100,
-            });
-            const prior = list.data.find(c =>
-              (c.user?.type === 'Bot' || c.user?.login === 'github-actions[bot]')
-              && c.body?.startsWith('## SBOM + Grype')
-            );
-            if (prior) {
-              await github.rest.issues.updateComment({
-                comment_id: prior.id,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body,
-              });
-            }
+  upload-sarif:
+    needs: syft-grype
+    if: >-
+      ${{ !cancelled() && inputs.upload-sarif &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download Grype SARIF
+        id: fetch
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: grype-sarif
+          path: ${{ runner.temp }}/sarif
+
+      - name: Upload to code scanning
+        if: steps.fetch.outcome == 'success'
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          sarif_file: ${{ runner.temp }}/sarif
+          category: grype

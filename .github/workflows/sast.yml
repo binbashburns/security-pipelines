@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       language:
-        description: "'auto' or comma-separated lang packs (javascript, csharp, ruby, python, go, java, php, typescript)"
+        description: "auto, or comma-separated packs (javascript, typescript, csharp, ruby, python, go, java, php). A pack list also runs p/ci."
         required: false
         default: "auto"
         type: string
@@ -13,146 +13,166 @@ on:
         required: false
         default: "none"
         type: string
+      comment-on-pr:
+        description: "Post or update a PR comment when the token permits it"
+        required: false
+        default: true
+        type: boolean
   workflow_dispatch:
+    inputs:
+      language:
+        description: "auto, or comma-separated packs (javascript, typescript, csharp, ruby, python, go, java, php). A pack list also runs p/ci."
+        required: false
+        default: "auto"
+        type: string
+      severity-fail:
+        description: "Fail on findings at this severity or above (ERROR | WARNING | INFO | none)"
+        required: false
+        default: "none"
+        type: string
+      comment-on-pr:
+        description: "Post or update a PR comment when the token permits it"
+        required: false
+        default: true
+        type: boolean
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: {}
 
 jobs:
   semgrep:
     runs-on: ubuntu-latest
-    container:
-      image: returntocorp/semgrep
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Build config flags
-        id: cfg
-        shell: bash
-        run: |
-          if [[ "${{ inputs.language }}" == "auto" ]]; then
-            echo "flags=--config=auto" >> "$GITHUB_OUTPUT"
-          else
-            flags="--config=p/ci"
-            IFS=',' read -ra packs <<< "${{ inputs.language }}"
-            for p in "${packs[@]}"; do
-              flags="$flags --config=p/$(echo "$p" | xargs)"
-            done
-            echo "flags=$flags" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Seed empty report
-        # Ensures downstream steps always read valid JSON, even if semgrep crashes before writing.
-        shell: bash
-        run: echo '{"results":[],"errors":[],"paths":{"scanned":[],"skipped":[]}}' > semgrep.json
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Run Semgrep
+        id: scan
+        timeout-minutes: 25
         shell: bash
+        env:
+          LANGUAGE_PACKS: ${{ inputs.language }}
+          SEVERITY_FAIL: ${{ inputs.severity-fail }}
         run: |
-          set +e
-          semgrep scan ${{ steps.cfg.outputs.flags }} \
-            --json --output=semgrep.json \
-            --metrics=off --disable-version-check
-          rc=$?
-          set -e
-          # Without --error, `semgrep scan` returns 0 even when findings exist, so any non-zero is a real tool failure.
-          if [[ "$rc" -ne 0 ]]; then
-            echo "::error::semgrep scan exited with code $rc"
+          gate=$(printf '%s' "$SEVERITY_FAIL" | tr '[:lower:]' '[:upper:]')
+          case "$gate" in
+            NONE|ERROR|WARNING|INFO) ;;
+            *) echo "::error::Invalid severity-fail; use ERROR, WARNING, INFO, or none"; exit 1 ;;
+          esac
+          if [[ "$LANGUAGE_PACKS" == "auto" ]]; then
+            flags=(--config=auto)
+          else
+            flags=(--config=p/ci)
+            [[ -n "$LANGUAGE_PACKS" && "$LANGUAGE_PACKS" != *, ]] || { echo "::error::Invalid language list"; exit 1; }
+            IFS=',' read -ra packs <<< "$LANGUAGE_PACKS"
+            for p in "${packs[@]}"; do
+              p="${p#"${p%%[![:space:]]*}"}"
+              p="${p%"${p##*[![:space:]]}"}"
+              case "$p" in
+                javascript|csharp|ruby|python|go|java|php|typescript) ;;
+                *) echo "::error::Unsupported language pack"; exit 1 ;;
+              esac
+              flags+=("--config=p/$p")
+            done
           fi
+          mkdir -p "$RUNNER_TEMP/semgrep"
+          # Only the scanner runs in its image; JavaScript actions run on Ubuntu.
+          # No --error: findings are evaluated separately from tool failures.
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -v "$PWD:/src:ro" -w /src \
+            -v "$RUNNER_TEMP/semgrep:/reports:rw" \
+            semgrep/semgrep:1.176.1@sha256:34ab619bf1391a24bfda3f05debd0d8a6ce3093c2d5f9d39cfc00f83c1397823 \
+            semgrep scan "${flags[@]}" \
+              --json --output=/reports/semgrep.json \
+              --metrics=off --disable-version-check
 
       - name: Upload report
-        if: always()
-        uses: actions/upload-artifact@v5
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: semgrep-report
-          path: semgrep.json
+          path: ${{ runner.temp }}/semgrep/semgrep.json
 
-      - name: Comment summary on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v8
+      - name: Summarize scan
+        id: report
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+          SEVERITY_FAIL: ${{ inputs.severity-fail }}
         with:
           script: |
             const fs = require('fs');
-            let report;
+            const path = require('path');
+            const summaryFile = 'semgrep-summary.md';
+            const gate = process.env.SEVERITY_FAIL.toUpperCase();
+            const order = { ERROR: 0, WARNING: 1, INFO: 2, NONE: 3 };
+            let body = '## Semgrep SAST\n\n';
+            let failure;
             try {
-              const raw = fs.readFileSync('semgrep.json', 'utf8');
-              report = raw ? JSON.parse(raw) : {};
-            } catch (e) {
-              report = {};
-            }
-            const results = report.results || [];
-            const counts = { ERROR: 0, WARNING: 0, INFO: 0 };
-            for (const r of results) {
-              const sev = (r.extra?.severity || 'INFO').toUpperCase();
-              if (counts.hasOwnProperty(sev)) counts[sev]++;
-            }
-            const scanned = (report.paths?.scanned || []).length;
-            const order = { ERROR: 0, WARNING: 1, INFO: 2 };
-            const top = [...results]
-              .sort((a, b) => (order[(a.extra?.severity || 'INFO').toUpperCase()] ?? 3)
-                            - (order[(b.extra?.severity || 'INFO').toUpperCase()] ?? 3))
-              .slice(0, 5);
-
-            let table = '';
-            if (top.length > 0) {
-              table = '\n\n| Severity | Rule | Location |\n| --- | --- | --- |\n';
-              for (const f of top) {
-                const sev = (f.extra?.severity || 'INFO').toUpperCase();
-                const rule = (f.check_id || '').split('.').pop();
-                const loc = `${f.path}:${f.start?.line ?? '?'}`;
-                table += `| ${sev} | \`${rule}\` | \`${loc}\` |\n`;
+              if (process.env.SCAN_OUTCOME !== 'success') throw new Error('Semgrep did not complete successfully; see workflow logs.');
+              if (!Object.hasOwn(order, gate)) throw new Error('Invalid severity-fail input.');
+              const report = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'semgrep/semgrep.json'), 'utf8'));
+              if (!Array.isArray(report.results) || !Array.isArray(report.errors) || !Array.isArray(report.paths?.scanned)) {
+                throw new Error('Semgrep report is missing required results, errors, or scanned paths.');
               }
-              if (results.length > 5) {
-                table += `\n_Showing top 5 of ${results.length}. Full list in the artifact._`;
+              const counts = { ERROR: 0, WARNING: 0, INFO: 0 };
+              for (const result of report.results) {
+                const severity = result.extra?.severity?.toUpperCase();
+                if (!Object.hasOwn(counts, severity)) throw new Error('Semgrep report contains an invalid finding severity.');
+                counts[severity]++;
               }
+              const scanned = report.paths.scanned.length;
+              body += scanned ? `Scanned **${scanned}** files.\n\n` : 'No files scanned; check language selection and ignore rules.\n\n';
+              body += `**${counts.ERROR}** error · **${counts.WARNING}** warning · **${counts.INFO}** info`;
+              if (report.errors.length) {
+                body += `\n\nScanner reported **${report.errors.length}** errors; review the report for incomplete coverage.`;
+                if (report.errors.some(error => String(error.level).toLowerCase() === 'error')) {
+                  failure = 'Semgrep reported scan errors; coverage may be incomplete.';
+                }
+              }
+              if (gate !== 'NONE') {
+                const gated = Object.entries(counts).reduce((sum, [severity, count]) => sum + (order[severity] <= order[gate] ? count : 0), 0);
+                if (gated) failure = `${gated} findings at ${gate} or above.`;
+              }
+            } catch (error) {
+              failure = `Scan failed: ${error.message}`;
+              body += failure;
             }
+            if (failure) body += `\n\n**Failed:** ${failure}`;
+            body += `\n\n[Report artifact](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}#artifacts)`;
 
-            const summaryLine = scanned > 0
-              ? `Scanned **${scanned}** file${scanned === 1 ? '' : 's'}.`
-              : `_No files scanned — check that the \`language\` input matches files in the repo._`;
+            await core.summary.addRaw(body).write();
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, summaryFile), body);
+            core.setOutput('ready', 'true');
+            if (failure) core.setFailed(failure);
 
-            const body =
-              `## Semgrep SAST\n\n` +
-              `${summaryLine}\n\n` +
-              `**${counts.ERROR}** error · **${counts.WARNING}** warning · **${counts.INFO}** info` +
-              table +
-              `\n\n[Report artifact](${context.payload.repository.html_url}/actions/runs/${context.runId}#artifacts)`;
-
-            const existing = await github.rest.issues.listComments({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              per_page: 100,
-            });
-            const prior = existing.data.find(c =>
-              (c.user?.type === 'Bot' || c.user?.login === 'github-actions[bot]')
-              && c.body?.startsWith('## Semgrep SAST')
-            );
+      - name: Comment summary on PR
+        if: >-
+          ${{ !cancelled() && steps.report.outputs.ready == 'true' && inputs.comment-on-pr &&
+              github.event_name == 'pull_request' &&
+              github.event.pull_request.head.repo.full_name == github.repository &&
+              github.actor != 'dependabot[bot]' }}
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SUMMARY_FILE: semgrep-summary.md
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const body = fs.readFileSync(path.join(process.env.RUNNER_TEMP, process.env.SUMMARY_FILE), 'utf8');
+            const marker = body.split('\n', 1)[0];
+            const params = { owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number };
+            const comments = await github.paginate(github.rest.issues.listComments, { ...params, per_page: 100 });
+            const prior = comments.find(c => c.user?.login === 'github-actions[bot]' && c.body?.startsWith(marker));
             if (prior) {
-              await github.rest.issues.updateComment({
-                comment_id: prior.id,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body,
-              });
+              await github.rest.issues.updateComment({ owner: params.owner, repo: params.repo, comment_id: prior.id, body });
             } else {
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body,
-              });
+              await github.rest.issues.createComment({ ...params, body });
             }
-
-      - name: Enforce severity gate
-        if: inputs.severity-fail != 'none'
-        shell: bash
-        run: |
-          gate="${{ inputs.severity-fail }}"
-          findings=$(jq -r --arg g "$gate" '
-            ($g | ascii_upcase) as $G |
-            [.results[]? | select((.extra.severity // "INFO") | ascii_upcase as $s |
-              ($G == "INFO") or ($G == "WARNING" and ($s == "WARNING" or $s == "ERROR")) or ($G == "ERROR" and $s == "ERROR")
-            )] | length' semgrep.json)
-          [[ "$findings" -eq 0 ]] || { echo "Findings at $gate or above: $findings"; exit 1; }
